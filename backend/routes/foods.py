@@ -230,6 +230,14 @@ def search_food():
 # foods like gulab jamun, samosa, roti, etc. correctly show the
 # "how many pieces" input on the frontend instead of always
 # defaulting to grams.
+#
+# NOTE on max_tokens / retry: qwen/qwen3.6-27b has a "thinking" mode,
+# and part of its token budget can go toward internal reasoning before
+# it writes the JSON. With a low max_tokens, the JSON can get cut off
+# mid-object, which Groq's JSON-mode validator rejects with a
+# 400 "json_validate_failed" error. Bumping max_tokens up gives the
+# model room to finish, and retrying once handles the rare case where
+# it still happens.
 # ─────────────────────────────────────────
 @foods.route('/scan-image', methods=['POST'])
 @jwt_required()
@@ -267,7 +275,9 @@ Reply ONLY with a JSON object in exactly this format, no other text:
 If you cannot identify any food in the image, reply with:
 {"error": "No food detected in this image"}"""
 
-    try:
+    def call_groq_vision():
+        """One attempt at asking Groq's vision model for the JSON result.
+        Raises on failure; caller decides whether to retry."""
         response = client.chat.completions.create(
             model="qwen/qwen3.6-27b",  # Groq's current vision-capable model
             messages=[
@@ -280,16 +290,33 @@ If you cannot identify any food in the image, reply with:
                 }
             ],
             response_format={"type": "json_object"},  # forces valid JSON back
-            max_tokens=500
+            max_tokens=1024  # raised from 500 — leaves room for thinking + full JSON
         )
-
         ai_reply = response.choices[0].message.content
-        result   = json.loads(ai_reply)
+        return json.loads(ai_reply)
 
-    except json.JSONDecodeError:
-        return jsonify({'error': 'AI response could not be read. Please try again or enter manually.'}), 500
-    except Exception as e:
-        return jsonify({'error': f'Image scan failed: {str(e)}'}), 500
+    result = None
+
+    # try twice: json_validate_failed / truncated-JSON failures are
+    # occasional and usually succeed on a second attempt
+    for attempt in range(2):
+        try:
+            result = call_groq_vision()
+            break
+        except json.JSONDecodeError:
+            continue
+        except Exception as e:
+            # Groq's own "invalid JSON" validation error also lands here
+            # (it's an API-level 400, not a Python JSONDecodeError)
+            if 'json_validate_failed' in str(e) or 'validate' in str(e).lower():
+                continue
+            # anything else (auth, rate limit, etc.) — no point retrying
+            return jsonify({'error': f'Image scan failed: {str(e)}'}), 500
+
+    if result is None:
+        return jsonify({
+            'error': 'The AI had trouble reading this photo clearly. Please try again with better lighting, or enter the food manually.'
+        }), 500
 
     if 'error' in result:
         return jsonify({'error': result['error'], 'not_found': True}), 404
