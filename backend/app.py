@@ -15,7 +15,10 @@ from routes.chat import chat_bp
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)  # ← must be AFTER app = Flask(__name__)
+CORS(app, origins=[
+    "https://calorie-lens-1.onrender.com",
+    "http://localhost:5173"
+])  # only allow requests from your deployed frontend + local dev
 
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
 from datetime import timedelta
